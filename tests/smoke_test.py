@@ -1,6 +1,8 @@
 """端到端冒烟测试：不依赖第三方库，直接调用 mime.py。"""
 import base64
+import io
 import sys
+import zipfile
 
 sys.path.insert(0, ".")
 from app import diff, mime
@@ -549,6 +551,162 @@ fields17 = {f["field"] for e in d17["entries"] if e["path"] == "parts[0]"
             for f in e.get("fields", [])}
 check("diff 检出 transferEncoding 变化", "transferEncoding" in fields17, fields17)
 check("diff 检出 decodeState 变化", "decodeState" in fields17, fields17)
+
+# 18. 附件提取与 ZIP 打包 -----------------------------------------------
+print("18) 附件提取 / RFC 2231 文件名 / ZIP 打包")
+from app import attachments as att
+
+_b18 = base64.b64encode(b"hello world")
+raw18 = b"".join([
+    b'Content-Type: multipart/mixed; boundary=ATT\r\n\r\n',
+    # 0: attachment + 普通 filename，base64 CTE 解码字节
+    b'--ATT\r\nContent-Disposition: attachment; filename="a.txt"\r\n'
+    b'Content-Transfer-Encoding: base64\r\n\r\n' + _b18 + b'\r\n',
+    # 1: RFC 2231 分段扩展文件名（filename*0* + filename*1*），优先于普通 filename
+    b"--ATT\r\nContent-Disposition: attachment;\r\n"
+    b" filename*0*=UTF-8''caf%c3;\r\n"
+    b" filename*1*=%a9.csv; filename=\"fallback.csv\"\r\n\r\nx\r\n",
+    # 2: form-data 但带 filename 参数 -> 也算附件；路径穿越字符被净化
+    b'--ATT\r\nContent-Disposition: form-data; name="f"; filename="../../etc/passwd"\r\n'
+    b'\r\nabc\r\n',
+    # 3/4: 重名 -> 按遍历顺序加序号
+    b'--ATT\r\nContent-Disposition: attachment; filename="dup.txt"\r\n\r\none\r\n',
+    b'--ATT\r\nContent-Disposition: attachment; filename="dup.txt"\r\n\r\ntwo\r\n',
+    # 5: 畸形 base64，未编辑 -> 禁导
+    b'--ATT\r\nContent-Disposition: attachment; filename="bad.b64"\r\n'
+    b'Content-Transfer-Encoding: base64\r\n\r\n@@@not-base64!!!\r\n',
+    # 6: 未知 CTE，未编辑 -> 禁导
+    b'--ATT\r\nContent-Disposition: attachment; filename="unk.bin"\r\n'
+    b'Content-Transfer-Encoding: x-uuencode\r\n\r\nwhatever\r\n',
+    # 7: 无文件名 -> 按节点路径命名
+    b'--ATT\r\nContent-Disposition: attachment\r\n'
+    b'Content-Transfer-Encoding: 8bit\r\n\r\n' + "无名".encode() + b'\r\n',
+    # 8: 普通 form-data 字段（无 filename、非 attachment）-> 不算附件
+    b'--ATT\r\nContent-Disposition: form-data; name="field"\r\n\r\nvalue\r\n',
+    b'--ATT--',
+])
+r18 = mime.parse_message(None, None, None, raw_base64=base64.b64encode(raw18).decode())
+check("解析 18 成功", r18["ok"], r18.get("error"))
+la18 = att.list_attachments(r18["tree"])
+a_list = la18["attachments"]
+check("发现 8 个附件（普通 form-data 字段排除）", la18["count"] == 8,
+      [(a["path"], a["filename"]) for a in a_list])
+check("可导出 6 个", la18["exportableCount"] == 6, la18["exportableCount"])
+by_path = {a["path"]: a for a in a_list}
+
+check("普通 filename 解析", by_path["parts[0]"]["filename"] == "a.txt"
+      and by_path["parts[0]"]["filenameSource"] == "plain")
+check("RFC 2231 分段拼接且优先", by_path["parts[1]"]["filename"] == "café.csv"
+      and by_path["parts[1]"]["filenameSource"] == "extended",
+      by_path["parts[1]"])
+check("CTE 解码后字节数", by_path["parts[0]"]["size"] == 11
+      and by_path["parts[1]"]["size"] == 1)
+check("路径分隔符与控制字符被净化（不残留 / 与反斜杠）",
+      "/" not in by_path["parts[2]"]["zipName"]
+      and "\\" not in by_path["parts[2]"]["zipName"]
+      and "etcpasswd" in by_path["parts[2]"]["zipName"],
+      by_path["parts[2]"]["zipName"])
+check("重名加序号（先序）",
+      by_path["parts[3]"]["zipName"] == "dup.txt"
+      and by_path["parts[4]"]["zipName"] == "dup (2).txt",
+      [a["zipName"] for a in a_list])
+check("无文件名按节点路径命名",
+      by_path["parts[7]"]["filenameSource"] == "path"
+      and by_path["parts[7]"]["zipName"] == "parts[7]",
+      by_path["parts[7]"])
+check("畸形 CTE 未编辑禁导且有原因",
+      by_path["parts[5]"]["exportable"] is False
+      and "畸形" in by_path["parts[5]"]["reason"], by_path["parts[5]"])
+check("未知 CTE 未编辑禁导且有原因",
+      by_path["parts[6]"]["exportable"] is False
+      and "未知" in by_path["parts[6]"]["reason"], by_path["parts[6]"])
+
+# ZIP：勾选全部可导出项
+sel = [a["path"] for a in a_list if a["exportable"]]
+zip_b, err = att.build_attachments_zip(r18["tree"], sel)
+check("ZIP 构建成功", err is None and zip_b is not None, err)
+zf = zipfile.ZipFile(io.BytesIO(zip_b))
+names = zf.namelist()
+check("ZIP 含 6 个条目且名称唯一", sorted(names) == sorted(set(names))
+      and len(names) == 6, names)
+check("ZIP 条目为 CTE 解码后字节",
+      zf.read("a.txt") == b"hello world"
+      and zf.read([a["zipName"] for a in a_list if a["path"] == "parts[1]"][0]) == b"x",
+      {n: zf.read(n) for n in names})
+check("ZIP 含 8bit UTF-8 内容",
+      zf.read("parts[7]") == "无名".encode(), zf.read("parts[7]"))
+
+# 勾选禁导项 -> 报错
+_bad, err_bad = att.build_attachments_zip(
+    r18["tree"], ["parts[5]", "parts[6]"])
+check("勾选禁导项被拒", err_bad and err_bad["code"] == "NOT_EXPORTABLE"
+      and err_bad["paths"] == ["parts[5]", "parts[6]"], err_bad)
+# 空选择 / 失效路径
+_e_empty, err_empty = att.build_attachments_zip(r18["tree"], [])
+check("空选择报错", err_empty and err_empty["code"] == "EMPTY_SELECTION")
+_e_stale, err_stale = att.build_attachments_zip(r18["tree"], ["parts[99]"])
+check("失效路径报错", err_stale and err_stale["code"] == "STALE_PATHS")
+
+# 编辑后：畸形 / 未知 CTE 叶子变为可导出，字节取编辑后内容
+t18 = r18["tree"]
+t18["parts"][5]["body"] = "edited-bad"
+t18["parts"][5]["bodyEdited"] = True
+t18["parts"][5]["bodyEncoding"] = "utf-8"
+t18["parts"][6]["body"] = base64.b64encode(b"edited-unk").decode()
+t18["parts"][6]["bodyEdited"] = True
+t18["parts"][6]["bodyEncoding"] = "base64"
+la18b = att.list_attachments(t18)
+bp = {a["path"]: a for a in la18b["attachments"]}
+check("编辑后畸形节点可导出", bp["parts[5]"]["exportable"]
+      and bp["parts[5]"]["edited"] and bp["parts[5]"]["size"] == 10,
+      bp["parts[5]"])
+check("编辑后未知 CTE 节点可导出（编辑通道 base64）",
+      bp["parts[6]"]["exportable"] and bp["parts[6]"]["size"] == 10,
+      bp["parts[6]"])
+zip_c, _ = att.build_attachments_zip(t18, ["parts[5]", "parts[6]"])
+zfc = zipfile.ZipFile(io.BytesIO(zip_c))
+check("ZIP 取编辑后字节",
+      zfc.read("bad.b64") == b"edited-bad"
+      and zfc.read("unk.bin") == b"edited-unk",
+      {n: zfc.read(n) for n in zfc.namelist()})
+
+# RFC 2231：非法扩展值回退普通 filename
+_h = [{"name": "Content-Disposition",
+       "value": "attachment; filename=\"ok.txt\"; filename*=UTF-8''bad%zz%41"}]
+_, _p = att.parse_disposition(_h)
+_fn, _src, _note = att.resolve_filename(_p)
+check("非法扩展值回退普通 filename", _fn == "ok.txt" and _src == "plain" and _note,
+      (_fn, _src, _note))
+
+# filename* 单值扩展（GBK 字符集）与控制字符净化
+_h2 = [{"name": "Content-Disposition",
+        "value": "attachment; filename*=gbk''%c4%e3%ba%c3"}]
+_, _p2 = att.parse_disposition(_h2)
+_fn2, _src2, _ = att.resolve_filename(_p2)
+check("filename* 单值 + 非 UTF-8 字符集", _fn2 == "你好" and _src2 == "extended",
+      (_fn2, _src2))
+check("控制字符/路径分隔符净化",
+      att.sanitize_filename("a\x00b/c\\d.txt", "parts[0]") == "abcd.txt",
+      att.sanitize_filename("a\x00b/c\\d.txt", "parts[0]"))
+check("净化后为空按路径命名",
+      att.sanitize_filename("../\x01", "parts[3]") == "parts[3]",
+      att.sanitize_filename("../\x01", "parts[3]"))
+
+# 嵌套 multipart 内的附件也能递归列出
+raw18n = (
+    b'Content-Type: multipart/mixed; boundary=O\r\n\r\n'
+    b'--O\r\nContent-Type: multipart/alternative; boundary=I\r\n\r\n'
+    b'--I\r\nContent-Disposition: attachment; filename="deep.dat"\r\n\r\n'
+    b'inside\r\n'
+    b'--I--\r\n'
+    b'--O--'
+)
+r18n = mime.parse_message(None, None, None, raw_base64=base64.b64encode(raw18n).decode())
+la_n = att.list_attachments(r18n["tree"])
+check("递归发现嵌套附件",
+      [(a["path"], a["zipName"]) for a in la_n["attachments"]]
+      == [("parts[0].parts[0]", "deep.dat")],
+      [(a["path"], a["zipName"]) for a in la_n["attachments"]])
 
 print(f"\n结果: {PASS} 通过, {FAIL} 失败")
 sys.exit(1 if FAIL else 0)

@@ -87,9 +87,30 @@
     </div>
   </section>
 
+  <section class="card hidden" id="attachmentsCard">
+    <div class="card-head">
+      <h2>3. 附件提取</h2>
+      <div class="head-actions">
+        <span id="attachMeta" class="parse-meta"></span>
+        <button id="btnRefreshAttach" class="btn btn-sm" type="button">刷新列表</button>
+      </div>
+    </div>
+    <div class="hint">递归列出带 <code>Content-Disposition: attachment</code> 或 <code>filename</code>
+      / <code>filename*</code> 参数的叶子。文件名遵循 RFC 2231（扩展值优先，非法时回退普通值）；
+      ZIP 内为 CTE 解码后的字节，已编辑叶子取编辑后的内容。畸形或未知 CTE 的未编辑叶子无法导出。</div>
+    <ul id="attachList" class="attach-list"></ul>
+    <div class="attach-bar">
+      <label class="check">
+        <input type="checkbox" id="attachSelectAll" checked>
+        全选可导出附件
+      </label>
+      <button id="btnDownloadZip" class="btn btn-primary" type="button">打包所选并下载 ZIP</button>
+    </div>
+  </section>
+
   <section class="card hidden" id="outputCard">
     <div class="card-head">
-      <h2>3. 重新编码结果</h2>
+      <h2>4. 重新编码结果</h2>
       <div id="encodeMeta" class="parse-meta"></div>
     </div>
     <ul id="encodeIssues" class="issues compact"></ul>
@@ -107,7 +128,7 @@
 
   <section class="card" id="compareCard">
     <div class="card-head">
-      <h2>4. 样本对比</h2>
+      <h2>5. 样本对比</h2>
       <div class="hint">把解析结果分别存为样本 A / B（保存在浏览器 localStorage，可来自不同报文或编辑前后），按树路径对齐比较媒体类型、头部、正文编码、boundary、序言/尾注与诊断代码。</div>
     </div>
 

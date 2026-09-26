@@ -5,18 +5,19 @@ from __future__ import annotations
 import os
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .attachments import build_attachments_zip, list_attachments
 from .diff import diff_results
 from .mime import encode_tree, parse_message
 
 app = FastAPI(
     title="MIME Multipart 报文检查器",
     description="按 RFC 2045/2046 解析嵌套 multipart 与 Content-Transfer-Encoding，"
-                "编辑后按原 boundary 规则与 CTE 折行重新编码。",
-    version="1.1.0",
+                "编辑后按原 boundary 规则与 CTE 折行重新编码；支持 RFC 2231 附件提取。",
+    version="1.2.0",
 )
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
@@ -55,6 +56,21 @@ class DiffRequest(BaseModel):
     b: DiffSample
 
 
+class AttachmentsRequest(BaseModel):
+    # tree 为当前解析/编辑后的树（与 /api/encode 的入参相同）
+    tree: dict
+
+    model_config = {"populate_by_name": True}
+
+
+class AttachmentsZipRequest(BaseModel):
+    tree: dict
+    paths: list[str] = Field(default_factory=list,
+                             description="勾选导出的叶子节点路径（tree 中的 path）")
+
+    model_config = {"populate_by_name": True}
+
+
 @app.get("/api/health")
 def health():
     return {"ok": True}
@@ -77,6 +93,24 @@ def api_encode(req: EncodeRequest):
 def api_diff(req: DiffRequest):
     result = diff_results(req.a.model_dump(), req.b.model_dump())
     return JSONResponse(result)
+
+
+@app.post("/api/attachments")
+def api_attachments(req: AttachmentsRequest):
+    """递归列出附件叶子：路径、文件名、字节数与（若不可导出）原因。"""
+    return JSONResponse(list_attachments(req.tree))
+
+
+@app.post("/api/attachments/zip")
+def api_attachments_zip(req: AttachmentsZipRequest):
+    """把勾选的附件以 CTE 解码后字节打包为 ZIP 并返回二进制。"""
+    data, err = build_attachments_zip(req.tree, req.paths)
+    if err is not None:
+        return JSONResponse(err, status_code=400)
+    return Response(content=data,
+                    media_type="application/zip",
+                    headers={"Content-Disposition":
+                             'attachment; filename="attachments.zip"'})
 
 
 @app.get("/")

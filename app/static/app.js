@@ -9,6 +9,15 @@ let tree = null;              // 当前可编辑树（对象引用，控件直�
 let encodedBytes = null;      // Uint8Array 编码结果
 const issueFilter = { error: true, warning: true, info: true };
 
+// 附件提取：最近一次 /api/attachments 返回、勾选集合、用户主动取消集合、
+// 上次列表中存在的路径与可导出路径（用于识别“新出现/变为可导出”的节点）
+let attachments = [];
+const attachChecked = new Set();
+const attachUnchecked = new Set();
+const attachSeen = new Set();
+const attachSeenExportable = new Set();
+let attachDebounce = null;
+
 // 样本对比：A/B 两份解析结果快照（localStorage 持久化）与最近一次 diff 结果
 const SAMPLES = { a: null, b: null };
 let diffResult = null;
@@ -72,7 +81,9 @@ const SAMPLE_NESTED =
   '=A2=E5=90=88=E4=BD=9C=EF=BC=81\r\n' +
   '--=20=E7=BB=93=E5=B0=BE=20--\r\n' +
   '--OUTER-001\r\n' +
-  'Content-Disposition: attachment; filename="payload.bin"\r\n' +
+  'Content-Disposition: attachment;\r\n' +
+  " filename*0*=UTF-8''pay%6C%6F%61%64;\r\n" +
+  ' filename*1*=%2Ebin; filename="payload-fallback.bin"\r\n' +
   'Content-Type: application/octet-stream\r\n' +
   'Content-Transfer-Encoding: base64\r\n' +
   '\r\n' +
@@ -253,8 +264,14 @@ function headerRow(table, node, idx) {
   const [nameIn, valIn] = $$("input", tr);
   nameIn.value = node.headers[idx].name || "";
   valIn.value = node.headers[idx].value || "";
-  nameIn.addEventListener("input", () => { node.headers[idx].name = nameIn.value; });
-  valIn.addEventListener("input", () => { node.headers[idx].value = valIn.value; });
+  nameIn.addEventListener("input", () => {
+    node.headers[idx].name = nameIn.value;
+    scheduleAttachRefresh();
+  });
+  valIn.addEventListener("input", () => {
+    node.headers[idx].value = valIn.value;
+    scheduleAttachRefresh();
+  });
   $("button", tr).addEventListener("click", () => {
     node.headers.splice(idx, 1);
     rerenderTree();
@@ -431,6 +448,7 @@ function renderNode(node, depth) {
     ta.addEventListener("input", () => {
       node.body = ta.value;
       node.bodyEdited = true;
+      scheduleAttachRefresh();
     });
     body.appendChild(ta);
   }
@@ -473,6 +491,7 @@ function rerenderTree() {
   rootEl.innerHTML = "";
   reindexPaths(tree, "root");
   rootEl.appendChild(renderNode(tree, 0));
+  scheduleAttachRefresh();
 }
 
 // ---------------------------------------------------------------- actions --
@@ -507,6 +526,9 @@ async function doParse() {
     parseResult = data;
     tree = data.tree;
     setCounts(data.counts);
+    attachUnchecked.clear();
+    attachSeen.clear();
+    attachSeenExportable.clear();
     $("#effectiveBoundary").textContent = data.effectiveBoundary ?? "—（无）";
     const metaBits = [];
     metaBits.push(`媒体类型 <b>${escapeHtml(data.mediaType || "—")}</b>`);
@@ -520,6 +542,7 @@ async function doParse() {
     $("#outputCard").classList.add("hidden");
     renderIssues($("#issuesList"), data.issues);
     rerenderTree();
+    loadAttachments({ resetSelection: true });
   } catch (e) {
     alert("解析失败：" + e.message);
   } finally {
@@ -598,6 +621,192 @@ async function copyOutput() {
     ta.classList.remove("hidden");
     ta.select();
     document.execCommand("copy");
+  }
+}
+
+// ------------------------------------------------------- attachments (ZIP) --
+
+const FILENAME_SOURCE_LABEL = {
+  extended: "RFC 2231 扩展值（filename*）",
+  plain: "filename 参数",
+  path: "按节点路径命名",
+};
+const ATTACH_DECODE_LABEL = {
+  raw: "原始字节（7bit/8bit/binary）",
+  decoded: "CTE 解码成功",
+  malformed: "畸形 CTE，未编辑不可导出",
+  passthrough: "未知 CTE，未编辑不可导出",
+};
+
+function scheduleAttachRefresh(delay = 400) {
+  // 正文输入/头部编辑/CTE 切换等树变化后延迟刷新附件列表（不清空当前勾选）
+  if (!tree) return;
+  clearTimeout(attachDebounce);
+  attachDebounce = setTimeout(loadAttachments, delay);
+}
+
+async function loadAttachments({ resetSelection = false } = {}) {
+  if (!tree) {
+    $("#attachmentsCard").classList.add("hidden");
+    return;
+  }
+  reindexPaths(tree, "root");
+  try {
+    const data = await postJSON("/api/attachments", { tree });
+    attachments = data.attachments || [];
+    if (resetSelection) {
+      attachChecked.clear();
+      attachSeen.clear();
+      attachSeenExportable.clear();
+      for (const a of attachments) {
+        attachSeen.add(a.path);
+        if (a.exportable) {
+          attachSeenExportable.add(a.path);
+          attachChecked.add(a.path);
+        }
+      }
+    } else {
+      const valid = new Set(attachments.map((a) => a.path));
+      // 结构变化后剔除失效路径（勾选与“主动取消”记忆都要清理）
+      for (const p of [...attachChecked]) if (!valid.has(p)) attachChecked.delete(p);
+      for (const p of [...attachUnchecked]) if (!valid.has(p)) attachUnchecked.delete(p);
+      for (const a of attachments) {
+        // 新出现的附件：默认勾选（除非用户在同一路径上主动取消过——
+        // 该路径在旧结构中已被删除的场景）；此前禁导、编辑后变为可导出的
+        // 节点也视为“新可导出”，自动勾选
+        if (a.exportable && !attachSeenExportable.has(a.path)
+            && !attachUnchecked.has(a.path)) {
+          attachChecked.add(a.path);
+        }
+        if (a.exportable) attachSeenExportable.add(a.path);
+        attachSeen.add(a.path);
+      }
+    }
+    $("#attachmentsCard").classList.remove("hidden");
+    renderAttachments(data);
+  } catch (e) {
+    $("#attachMeta").textContent = "附件列表加载失败：" + e.message;
+  }
+}
+
+// 用户主动取消过的路径在解析新报文时清空（见 doParse）
+
+function renderAttachments(data) {
+  const list = $("#attachList");
+  list.innerHTML = "";
+  if (!attachments.length) {
+    const li = document.createElement("li");
+    li.className = "attach-empty";
+    li.textContent = "该报文中没有附件叶子（Content-Disposition: attachment 或带 filename 参数的叶子）。";
+    list.appendChild(li);
+  } else {
+    for (const a of attachments) list.appendChild(renderAttachmentRow(a));
+  }
+  $("#attachMeta").innerHTML =
+    `共 <b>${data.count}</b> 个附件 · 可导出 <b>${data.exportableCount}</b> 个`;
+  const selectable = attachments.filter((a) => a.exportable);
+  $("#attachSelectAll").checked = selectable.length > 0
+    && selectable.every((a) => attachChecked.has(a.path));
+  $("#btnDownloadZip").disabled =
+    !attachments.some((a) => a.exportable && attachChecked.has(a.path));
+}
+
+function renderAttachmentRow(a) {
+  const li = document.createElement("li");
+  li.className = "attach-entry" + (a.exportable ? "" : " blocked");
+
+  const cb = document.createElement("input");
+  cb.type = "checkbox";
+  cb.className = "attach-check";
+  cb.checked = !!attachChecked.has(a.path);
+  cb.disabled = !a.exportable;
+  cb.addEventListener("click", (e) => e.stopPropagation());
+  cb.addEventListener("change", () => {
+    if (cb.checked) { attachChecked.add(a.path); attachUnchecked.delete(a.path); }
+    else { attachChecked.delete(a.path); attachUnchecked.add(a.path); }
+    renderAttachments({ count: attachments.length,
+      exportableCount: attachments.filter((x) => x.exportable).length });
+  });
+  li.appendChild(cb);
+
+  const main = document.createElement("div");
+  main.className = "attach-main";
+  const disp = a.disposition
+    ? `<span class="attach-disp">${escapeHtml(a.disposition)}</span>` : "";
+  const warnCls = a.decodeState === "malformed" || a.decodeState === "passthrough"
+    ? "warn" : (a.edited ? "edited" : "ok");
+  main.innerHTML =
+    `<div class="attach-line1">` +
+    `<span class="attach-name" title="ZIP 内文件名：${escapeHtml(a.zipName)}">${escapeHtml(a.zipName)}</span>` +
+    `<span class="attach-size">${humanSize(a.size)}</span>` +
+    `</div>` +
+    `<div class="attach-line2">` +
+    `<span class="attach-path">${escapeHtml(a.path)}</span>` +
+    disp +
+    `<span class="attach-badge">${escapeHtml(a.mediaType)}</span>` +
+    `<span class="attach-src" title="文件名来源">${escapeHtml(FILENAME_SOURCE_LABEL[a.filenameSource] || a.filenameSource)}</span>` +
+    `<span class="attach-cte ${warnCls}" title="Content-Transfer-Encoding / 解码状态">` +
+    `CTE: ${escapeHtml(a.transferEncoding)} · ${escapeHtml(ATTACH_DECODE_LABEL[a.decodeState] || a.decodeState)}` +
+    (a.edited ? " · 已编辑" : "") + `</span>` +
+    `</div>`;
+  if (a.filenameNote && a.filenameSource !== "extended") {
+    const note = document.createElement("div");
+    note.className = "attach-note";
+    note.textContent = "扩展文件名（filename*）非法，已回退"
+      + (a.filenameSource === "plain" ? "普通 filename" : "按节点路径命名")
+      + "：" + a.filenameNote;
+    main.appendChild(note);
+  }
+  if (!a.exportable && a.reason) {
+    const reason = document.createElement("div");
+    reason.className = "attach-reason";
+    reason.textContent = "⛔ " + a.reason;
+    main.appendChild(reason);
+  }
+  li.appendChild(main);
+  return li;
+}
+
+async function downloadAttachmentsZip() {
+  if (!tree) return;
+  const paths = attachments
+    .filter((a) => a.exportable && attachChecked.has(a.path))
+    .map((a) => a.path);
+  if (!paths.length) {
+    alert("请先勾选至少一个可导出的附件");
+    return;
+  }
+  reindexPaths(tree, "root");
+  $("#btnDownloadZip").disabled = true;
+  try {
+    const res = await fetch("/api/attachments/zip", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tree, paths }),
+    });
+    if (!res.ok) {
+      let detail = `HTTP ${res.status}`;
+      try {
+        const j = await res.json();
+        detail = j.error || detail;
+      } catch (_) { /* ignore */ }
+      await loadAttachments();   // 状态可能已变化（如编辑后变为可导出）
+      alert("打包失败：" + detail);
+      return;
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "attachments.zip";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (e) {
+    alert("打包失败：" + e.message);
+  } finally {
+    $("#btnDownloadZip").disabled = false;
   }
 }
 
@@ -966,6 +1175,22 @@ function init() {
   });
   $("#btnCompare").addEventListener("click", doCompare);
   $("#btnExportDiff").addEventListener("click", exportDiff);
+  // 附件提取
+  $("#btnRefreshAttach").addEventListener("click", () => loadAttachments());
+  $("#btnDownloadZip").addEventListener("click", downloadAttachmentsZip);
+  $("#attachSelectAll").addEventListener("change", (e) => {
+    if (e.target.checked) {
+      for (const a of attachments) {
+        if (a.exportable) { attachChecked.add(a.path); attachUnchecked.delete(a.path); }
+      }
+    } else {
+      for (const a of attachments) {
+        if (a.exportable) { attachChecked.delete(a.path); attachUnchecked.add(a.path); }
+      }
+    }
+    renderAttachments({ count: attachments.length,
+      exportableCount: attachments.filter((x) => x.exportable).length });
+  });
   $$(".diff-filters .chip").forEach((chip) => {
     chip.addEventListener("click", () => {
       const c = chip.dataset.change;

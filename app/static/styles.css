@@ -354,6 +354,53 @@ textarea { resize: vertical; min-height: 180px; line-height: 1.5; }
   padding: 24px; border-top: 1px solid var(--border);
 }
 
+/* attachments */
+.attach-list { list-style: none; margin: 12px 0 0; padding: 0; }
+.attach-entry {
+  display: flex; gap: 12px; align-items: flex-start;
+  border: 1px solid var(--border); border-left: 3px solid var(--primary);
+  border-radius: 8px; padding: 9px 12px; margin-bottom: 8px;
+  background: var(--panel-2);
+}
+.attach-entry.blocked { border-left-color: var(--warning); opacity: .92; }
+.attach-check { width: auto; margin-top: 5px; flex: 0 0 auto; }
+.attach-main { flex: 1; min-width: 0; }
+.attach-line1 { display: flex; align-items: baseline; gap: 10px; }
+.attach-name {
+  font-weight: 600; font-size: 13px; word-break: break-all;
+}
+.attach-size { margin-left: auto; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.attach-line2 {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  margin-top: 3px; font-size: 11px;
+}
+.attach-path { font-family: var(--mono); color: var(--muted); }
+.attach-disp {
+  font-size: 10px; font-weight: 700; text-transform: uppercase;
+  padding: 1px 7px; border-radius: 5px;
+  background: #2b3c5e; color: #9cc0ff;
+}
+.attach-badge {
+  font-family: var(--mono); padding: 0 7px; border-radius: 999px;
+  background: #22304a; color: #9cc0ff; border: 1px solid #30456b;
+}
+.attach-src { color: var(--muted); }
+.attach-cte { font-family: var(--mono); padding: 0 7px; border-radius: 999px; }
+.attach-cte.ok { color: #7fe7b8; background: #16342a; }
+.attach-cte.edited { color: #a7e3f2; background: var(--info-bg); }
+.attach-cte.warn { color: var(--warning); background: var(--warning-bg); }
+.attach-note { color: var(--muted); font-size: 11px; margin-top: 4px; }
+.attach-reason { color: var(--warning); font-size: 12px; margin-top: 5px; }
+.attach-empty {
+  border: 1px dashed var(--border); border-radius: 8px;
+  padding: 12px; color: var(--muted); font-size: 13px; text-align: center;
+}
+.attach-bar {
+  margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  flex-wrap: wrap;
+}
+
 @media (max-width: 760px) {
   .two-col { grid-template-columns: 1fr; }
   .sample-slots, .diff-trees { grid-template-columns: 1fr; }

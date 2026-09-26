@@ -27,6 +27,14 @@
   按树路径对齐比较媒体类型、头部、正文编码、boundary、序言/尾注与诊断代码；
   差异以可展开的新增/删除/修改清单展示，点击条目即可在两侧结构树中定位节点，
   并可导出 JSON 差异报告。
+- 📎 **附件提取（ZIP）**：从当前解析或编辑后的树递归列出带
+  `Content-Disposition: attachment` 或 `filename` 参数的叶子，展示
+  节点路径、文件名、字节数与不可导出原因，勾选后打包为 ZIP 下载。
+  文件名遵循 **RFC 2231**：支持 `filename*` 与 `filename*0*`/`filename*1`
+  分段拼接，扩展值优先于普通 `filename`，非法扩展值回退普通值，无文件名时
+  按节点路径命名；文件名中的路径分隔符与控制字符被清除，重名按遍历顺序加序号。
+  ZIP 使用 **CTE 解码后的字节**（已编辑叶子取编辑后内容）；畸形或未知
+  Content-Transfer-Encoding 的**未编辑**叶子禁止导出并说明原因。
 
 ---
 
@@ -90,7 +98,24 @@ http://localhost:8000/docs 。
      保证逐字节稳定；原始载荷保存在节点的 `rawBodyBase64` 字段中，不会丢失。
 5. 勾选/取消“编码时包含顶层头部”，点击 **重新编码并下载**。
 6. 在结果区可重新下载、复制为文本，或查看编码后的完整报文。
-7. **样本对比**（页面底部「4. 样本对比」卡片）：
+7. **附件提取**（「3. 附件提取」卡片，解析后自动出现）：
+   - 递归列出所有带 `Content-Disposition: attachment` 或 `filename` /
+     `filename*` 参数的叶子（包括嵌套 multipart 内部），每行显示
+     **ZIP 内文件名、字节数、节点路径、disposition、媒体类型、文件名来源、
+     CTE 与解码状态**；
+   - 文件名按 **RFC 2231** 解析：`filename*=UTF-8''%E2%82%AC` 单值或
+     `filename*0*`/`filename*1*` 分段（首段携带 `charset'language'`，
+     后续段可以是扩展段或普通段）优先；扩展值非法（错误的百分号转义、
+     未知字符集、分段不连续等）时回退普通 `filename`，并在行内注明原因；
+     两者都没有时按节点路径命名（如 `parts[2].parts[0]`）；
+   - 路径分隔符（`/`、`\`）与控制字符会从文件名中删除，重名按树的先序
+     遍历顺序自动加序号（`report.csv`、`report (2).csv`）；
+   - 勾选要导出的附件后点击 **打包所选并下载 ZIP**：ZIP 条目内容是
+     **CTE 解码后的字节**，已编辑叶子（正文改动或 CTE 切换）取编辑后的
+     内容；未编辑叶子若处于 `malformed`（畸形 base64/QP）或
+     `passthrough`（未知 CTE）状态则**无法勾选**，并显示具体原因——
+     在结构树中编辑该节点后即变为可导出。
+8. **样本对比**（页面底部「5. 样本对比」卡片）：
    - 解析一份报文后点击结构区右上角的 **存为样本 A**；再解析（或编辑后重新解析）
      另一份报文，点击 **存为样本 B**。样本保存在浏览器 localStorage，刷新不丢失；
    - 点击 **开始对比**，查看按树路径对齐的差异清单（新增 / 删除 / 修改 / 未变化，
@@ -297,6 +322,85 @@ http://localhost:8000/docs 。
 - 长文本字段（正文、序言/尾注）以预览形式返回，`truncated: true` 时
   `length` 为完整长度（上限见 `previewLimit`）。
 
+### `POST /api/attachments`
+
+附件提取：从当前解析或编辑后的树递归列出附件叶子。请求体只有
+`/api/parse` 返回（可能已被前端修改）的 `tree`：
+
+```json
+{ "tree": { /* /api/parse 返回的 tree，可修改 */ } }
+```
+
+响应（节选）：
+
+```json
+{
+  "ok": true,
+  "count": 3,
+  "exportableCount": 2,
+  "attachments": [
+    {
+      "path": "parts[1].parts[0]",
+      "mediaType": "text/csv",
+      "disposition": "attachment",
+      "filename": "café.csv",
+      "filenameSource": "extended",
+      "filenameNote": null,
+      "zipName": "café.csv",
+      "transferEncoding": "quoted-printable",
+      "decodeState": "decoded",
+      "edited": false,
+      "exportable": true,
+      "reason": null,
+      "size": 42
+    },
+    {
+      "path": "parts[2]",
+      "filename": "bad.b64",
+      "filenameSource": "plain",
+      "zipName": "bad.b64",
+      "transferEncoding": "base64",
+      "decodeState": "malformed",
+      "edited": false,
+      "exportable": false,
+      "reason": "Content-Transfer-Encoding（base64）的传输正文畸形，未编辑时无法保证 CTE 解码字节正确；请在结构树中编辑该节点后再导出",
+      "size": 0
+    }
+  ]
+}
+```
+
+字段说明：
+
+| 字段 | 含义 |
+| --- | --- |
+| `path` | 叶子在树中的节点路径（同时是下载请求的选择键） |
+| `disposition` | Content-Disposition 类型（`attachment`/`form-data`/…），可能为 `null` |
+| `filename` | 最终选用的文件名原始值；无文件名时为 `null`（此时按路径命名） |
+| `filenameSource` | `extended`（RFC 2231 扩展值）/ `plain`（普通 filename）/ `path`（按路径命名） |
+| `filenameNote` | 扩展值存在但非法、已回退普通值时的原因说明 |
+| `zipName` | 净化路径分隔符/控制字符、重名加序号之后的 ZIP 内文件名 |
+| `decodeState` | 与叶子节点一致：`raw`/`decoded` 可直接导出；`malformed`/`passthrough` 仅在编辑后可导出 |
+| `edited` | 叶子是否已被编辑（`bodyEdited`） |
+| `exportable` / `reason` | 当前是否可导出，以及不可导出的原因 |
+| `size` | CTE 解码后（编辑后）的字节数；不可导出时为 `0` |
+
+### `POST /api/attachments/zip`
+
+把勾选的附件以 **CTE 解码后字节** 打包为 ZIP（`application/zip`，
+DEFLATE 压缩；非 ASCII 文件名置 UTF-8 语言编码标志位）：
+
+```json
+{
+  "tree": { /* 当前树，可修改 */ },
+  "paths": ["parts[0]", "parts[1].parts[0]"]
+}
+```
+
+服务端会按树的先序遍历顺序重新校验每个路径：未勾选任何附件
+（`EMPTY_SELECTION`）、路径在当前树中不存在（`STALE_PATHS`）或所选节点
+当前不可导出（`NOT_EXPORTABLE`）时返回 `400` 与 JSON 错误体。
+
 ### `GET /api/health`
 
 返回 `{"ok": true}`，供容器健康检查使用。
@@ -309,13 +413,14 @@ http://localhost:8000/docs 。
 .
 ├── app/
 │   ├── __init__.py
-│   ├── main.py              # FastAPI 应用、/api/parse、/api/encode、/api/diff、静态文件
+│   ├── main.py              # FastAPI 应用、/api/parse、/api/encode、/api/diff、/api/attachments、静态文件
 │   ├── mime.py              # 零第三方依赖的 MIME 解析 / 重新编码核心
+│   ├── attachments.py       # RFC 2231 文件名解析、附件发现与 ZIP 打包（标准库 zipfile）
 │   ├── diff.py              # 样本对比：按树路径对齐的字段级差异计算
 │   └── static/
 │       ├── index.html       # 页面结构
 │       ├── styles.css       # 深色主题样式
-│       └── app.js           # 原生 JS：示例、树形编辑器、样本对比、下载
+│       └── app.js           # 原生 JS：示例、树形编辑器、附件提取、样本对比、下载
 ├── tests/
 │   └── smoke_test.py        # 解析/编码/对比端到端测试（仅需 Python 标准库）
 ├── requirements.txt
@@ -338,7 +443,12 @@ python3 tests/smoke_test.py
 字段级差异、头部逐行对比、诊断代码归属与全局诊断），以及
 Content-Transfer-Encoding（base64 / quoted-printable / 7bit / 8bit / binary
 的识别、解码、畸形诊断与载荷保留、切换后按 76 字符折行重新编码、
-未编辑节点字节稳定、超长行/裸换行/7bit 约束诊断、diff 检出 CTE 变化）。
+未编辑节点字节稳定、超长行/裸换行/7bit 约束诊断、diff 检出 CTE 变化），以及
+附件提取（递归发现、form-data 带 filename、普通 form-data 字段排除、
+RFC 2231 `filename*` 单值与 `filename*0*` 分段拼接/非 UTF-8 字符集/
+非法扩展值回退、路径分隔符与控制字符净化、重名序号、无文件名按路径命名、
+CTE 解码字节计数、畸形/未知 CTE 未编辑禁导、编辑后可导且取编辑后字节、
+ZIP 条目内容与错误码、嵌套 multipart 附件）。
 
 ---
 
