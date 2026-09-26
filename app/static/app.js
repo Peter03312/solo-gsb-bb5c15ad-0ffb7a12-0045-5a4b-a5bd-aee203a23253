@@ -78,7 +78,15 @@ const SAMPLE_NESTED =
   '\r\n' +
   'TUlNRQABAiBiaW5hcnkg//4gcGF5bG9hZA0KbGluZTINCg==\r\n' +
   '--OUTER-001\r\n' +
-  'Content-Disposition: attachment; filename="report.csv"\r\n' +
+  // 同名附件：ZIP 中按遍历顺序自动重命名为 payload(1).bin
+  'Content-Disposition: attachment; filename="payload.bin"\r\n' +
+  'Content-Type: text/plain\r\n' +
+  '\r\n' +
+  'second payload with the same name\r\n' +
+  '--OUTER-001\r\n' +
+  // RFC 2231：扩展文件名 报告.csv（UTF-8 百分号编码）优先于普通 filename
+  'Content-Disposition: attachment; filename="report.csv"; ' +
+  "filename*=utf-8''%E6%8A%A5%E5%91%8A.csv\r\n" +
   'Content-Type: text/csv; charset=utf-8\r\n' +
   'Content-Transfer-Encoding: 8bit\r\n' +
   '\r\n' +
@@ -96,6 +104,7 @@ const SAMPLE_BAD =
   '\n' +
   'good part\n' +
   '--BROKEN\n' +
+  'Content-Disposition: attachment; filename="broken.bin"\n' +
   'Content-Type: application/octet-stream\n' +
   'Content-Transfer-Encoding: base64\n' +
   '\n' +
@@ -473,6 +482,8 @@ function rerenderTree() {
   rootEl.innerHTML = "";
   reindexPaths(tree, "root");
   rootEl.appendChild(renderNode(tree, 0));
+  // 结构/头部/CTE 的就地增删会改变附件列表，后台静默刷新
+  scheduleAttachmentsRefresh();
 }
 
 // ---------------------------------------------------------------- actions --
@@ -507,6 +518,8 @@ async function doParse() {
     parseResult = data;
     tree = data.tree;
     setCounts(data.counts);
+    attachmentItems = [];
+    attachmentSelection.clear();
     $("#effectiveBoundary").textContent = data.effectiveBoundary ?? "—（无）";
     const metaBits = [];
     metaBits.push(`媒体类型 <b>${escapeHtml(data.mediaType || "—")}</b>`);
@@ -517,9 +530,11 @@ async function doParse() {
 
     $("#issuesCard").classList.remove("hidden");
     $("#treeCard").classList.remove("hidden");
+    $("#attachmentsCard").classList.remove("hidden");
     $("#outputCard").classList.add("hidden");
     renderIssues($("#issuesList"), data.issues);
     rerenderTree();
+    refreshAttachments();
   } catch (e) {
     alert("解析失败：" + e.message);
   } finally {
@@ -598,6 +613,208 @@ async function copyOutput() {
     ta.classList.remove("hidden");
     ta.select();
     document.execCommand("copy");
+  }
+}
+
+// ------------------------------------------------------- attachments zip --
+
+let attachmentItems = [];        // /api/attachments 返回的附件描述符
+const attachmentSelection = new Set();  // 勾选的叶子 path（跨刷新保留）
+let attachmentsRefreshTimer = null;
+
+function scheduleAttachmentsRefresh() {
+  if ($("#attachmentsCard").classList.contains("hidden")) return;
+  clearTimeout(attachmentsRefreshTimer);
+  attachmentsRefreshTimer = setTimeout(refreshAttachments, 300);
+}
+
+const FILENAME_SOURCE_LABEL = {
+  rfc2231: "RFC 2231 filename*",
+  header: "filename 参数",
+  path: "按节点路径命名",
+};
+
+async function refreshAttachments() {
+  if (!tree) return;
+  reindexPaths(tree, "root");
+  try {
+    const data = await postJSON("/api/attachments", { tree });
+    attachmentItems = data.items || [];
+    // 清理已不存在的勾选项
+    const valid = new Set(attachmentItems.map((it) => it.path));
+    for (const p of Array.from(attachmentSelection)) {
+      if (!valid.has(p)) attachmentSelection.delete(p);
+    }
+    renderAttachments(data);
+  } catch (e) {
+    alert("附件列表获取失败：" + e.message);
+  }
+}
+
+function renderAttachments(data) {
+  const tbody = $("#attachmentsList");
+  tbody.innerHTML = "";
+  const items = data.items || [];
+  for (const it of items) {
+    const tr = document.createElement("tr");
+    tr.className = it.exportable ? "att-exportable" : "att-blocked";
+
+    const tdCheck = document.createElement("td");
+    tdCheck.className = "col-check";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.dataset.path = it.path;
+    cb.checked = it.exportable && attachmentSelection.has(it.path);
+    cb.disabled = !it.exportable;
+    cb.title = it.exportable ? "" : (it.reason || "不可导出");
+    cb.addEventListener("change", () => {
+      if (cb.checked) attachmentSelection.add(it.path);
+      else attachmentSelection.delete(it.path);
+      updateAttachmentToolbar();
+    });
+    tdCheck.appendChild(cb);
+    tr.appendChild(tdCheck);
+
+    const tdName = document.createElement("td");
+    tdName.className = "col-name";
+    if (it.exportable) {
+      const sourceKey = FILENAME_SOURCE_LABEL[it.filenameSource] ? it.filenameSource : "header";
+      tdName.innerHTML = `<span class="att-zipname">${escapeHtml(it.exportName)}</span>` +
+        `<span class="att-src src-${sourceKey}">` +
+        `${escapeHtml(FILENAME_SOURCE_LABEL[sourceKey])}</span>`;
+      if (it.filename && it.filename !== it.exportName) {
+        const orig = document.createElement("div");
+        orig.className = "att-orig";
+        orig.textContent = "原始文件名：" + it.filename;
+        orig.title = "已按跨平台规则净化（去除路径分隔符/控制字符等）";
+        tdName.appendChild(orig);
+      }
+    } else {
+      tdName.innerHTML = `<span class="att-zipname muted">${escapeHtml(it.filename || "（无文件名）")}</span>`;
+    }
+    tr.appendChild(tdName);
+
+    const tdPath = document.createElement("td");
+    tdPath.className = "col-path";
+    tdPath.textContent = it.path;
+    tr.appendChild(tdPath);
+
+    const tdDisp = document.createElement("td");
+    tdDisp.className = "col-disp";
+    const dispBits = [];
+    if (it.disposition) {
+      dispBits.push(`<span class="att-disp">${escapeHtml(it.disposition)}</span>`);
+    }
+    if (it.name != null) dispBits.push(`<span class="att-fieldname">name=${escapeHtml(it.name)}</span>`);
+    tdDisp.innerHTML = dispBits.join("<br>") || '<span class="muted">—</span>';
+    tr.appendChild(tdDisp);
+
+    const tdSize = document.createElement("td");
+    tdSize.className = "col-size";
+    tdSize.textContent = it.exportable
+      ? humanSize(it.size)
+      : `原始 ${humanSize(it.wireSize || 0)}`;
+    tr.appendChild(tdSize);
+
+    const tdReason = document.createElement("td");
+    tdReason.className = "col-reason";
+    if (!it.exportable) {
+      const div = document.createElement("div");
+      div.className = "att-reason";
+      div.textContent = "⛔ " + (it.reason || "不可导出");
+      tdReason.appendChild(div);
+    }
+    if (it.filenameNote) {
+      const note = document.createElement("div");
+      note.className = "att-fn-note";
+      note.textContent = "ℹ " + it.filenameNote;
+      tdReason.appendChild(note);
+    }
+    if (!it.exportable && !it.reason && !it.filenameNote) {
+      tdReason.textContent = "—";
+    }
+    tr.appendChild(tdReason);
+    tbody.appendChild(tr);
+  }
+  if (!items.length) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = '<td colspan="6" class="att-empty">当前报文树中没有附件叶子' +
+      "（需要 Content-Disposition: attachment 或带 filename 参数的叶子）</td>";
+    tbody.appendChild(tr);
+  }
+  updateAttachmentToolbar(data);
+}
+
+function selectedAttachmentItems() {
+  return attachmentItems.filter((it) => it.exportable && attachmentSelection.has(it.path));
+}
+
+function updateAttachmentToolbar(data) {
+  const items = (data && data.items) || attachmentItems;
+  const exportable = items.filter((it) => it.exportable);
+  const blocked = items.length - exportable.length;
+  const selected = selectedAttachmentItems();
+  const totalBytes = exportable.reduce((s, it) => s + (it.size || 0), 0);
+  const selBytes = selected.reduce((s, it) => s + (it.size || 0), 0);
+  const bits = [`共 <b>${items.length}</b> 个附件`,
+                `可导出 <b>${exportable.length}</b>`];
+  if (blocked) bits.push(`禁导 <b>${blocked}</b>`);
+  bits.push(`合计 <b>${humanSize(totalBytes)}</b>`);
+  if (selected.length) {
+    bits.push(`已选 <b>${selected.length}</b> 个 / <b>${humanSize(selBytes)}</b>`);
+  }
+  $("#attachmentsMeta").innerHTML = bits.join("　·　");
+  $("#btnDownloadZip").disabled = selected.length === 0;
+  const selectAll = $("#selectAllAttachments");
+  selectAll.checked = exportable.length > 0 &&
+    exportable.every((it) => attachmentSelection.has(it.path));
+  selectAll.indeterminate = selected.length > 0 && selected.length < exportable.length;
+}
+
+async function downloadAttachmentZip() {
+  if (!tree) return;
+  // 下载前用最新编辑状态重新计算（文件名/CTE/正文的就地修改一并生效）
+  await refreshAttachments();
+  const paths = selectedAttachmentItems().map((it) => it.path);
+  if (!paths.length) {
+    alert("请先勾选至少一个可导出附件");
+    return;
+  }
+  $("#btnDownloadZip").disabled = true;
+  const oldText = $("#btnDownloadZip").textContent;
+  $("#btnDownloadZip").textContent = "打包中…";
+  try {
+    const res = await fetch("/api/attachments/zip", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tree, paths }),
+    });
+    if (!res.ok) {
+      let msg = `HTTP ${res.status}`;
+      try {
+        const j = await res.json();
+        msg = j.error || msg;
+      } catch (_) { /* ignore */ }
+      throw new Error(msg);
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "attachments.zip";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    const skipped = res.headers.get("X-Attachment-Skipped");
+    if (skipped && skipped !== "0") {
+      alert(`有 ${skipped} 个所选附件因当前不可导出被跳过（详见列表）。`);
+    }
+  } catch (e) {
+    alert("ZIP 下载失败：" + e.message);
+  } finally {
+    $("#btnDownloadZip").textContent = oldText;
+    updateAttachmentToolbar();
   }
 }
 
@@ -966,6 +1183,17 @@ function init() {
   });
   $("#btnCompare").addEventListener("click", doCompare);
   $("#btnExportDiff").addEventListener("click", exportDiff);
+  // 附件提取
+  $("#btnRefreshAttachments").addEventListener("click", refreshAttachments);
+  $("#btnDownloadZip").addEventListener("click", downloadAttachmentZip);
+  $("#selectAllAttachments").addEventListener("change", (e) => {
+    for (const it of attachmentItems) {
+      if (!it.exportable) continue;
+      if (e.target.checked) attachmentSelection.add(it.path);
+      else attachmentSelection.delete(it.path);
+    }
+    renderAttachments({ items: attachmentItems });
+  });
   $$(".diff-filters .chip").forEach((chip) => {
     chip.addEventListener("click", () => {
       const c = chip.dataset.change;

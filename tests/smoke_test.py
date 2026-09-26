@@ -1,9 +1,11 @@
 """端到端冒烟测试：不依赖第三方库，直接调用 mime.py。"""
 import base64
+import io
 import sys
+import zipfile
 
 sys.path.insert(0, ".")
-from app import diff, mime
+from app import attachments, diff, mime
 
 PASS = 0
 FAIL = 0
@@ -549,6 +551,252 @@ fields17 = {f["field"] for e in d17["entries"] if e["path"] == "parts[0]"
             for f in e.get("fields", [])}
 check("diff 检出 transferEncoding 变化", "transferEncoding" in fields17, fields17)
 check("diff 检出 decodeState 变化", "decodeState" in fields17, fields17)
+
+# 18. 附件提取：RFC 2231 文件名解析 ------------------------------------------
+print("18) RFC 2231 Content-Disposition 文件名")
+_disp, _p, _ = mime.parse_content_disposition(
+    'attachment; filename="old.txt"; filename*=utf-8\'\'r%C3%A9port.csv')
+_fn, _ext, _note = mime.resolve_filename(_p)
+check("filename* 优先于 filename", _fn == "réport.csv" and _ext is True, (_fn, _ext))
+
+_disp, _p, _ = mime.parse_content_disposition(
+    'attachment; filename="plain.bin"; '
+    "filename*0*=utf-8''r%C3%A9; filename*1*=port; filename*2=.csv")
+_fn, _ext, _note = mime.resolve_filename(_p)
+check("filename*0* 分段组装", _fn == "réport.csv" and _ext, (_fn, _ext))
+
+# 续段允许不带末尾星号（filename*1）
+_disp, _p, _ = mime.parse_content_disposition(
+    "attachment; filename*0*=utf-8''r%C3%A9; filename*1=port.csv")
+_fn, _ext, _note = mime.resolve_filename(_p)
+check("filename*1 续段（无末尾星号）", _fn == "réport.csv", _fn)
+
+# 多字节字符跨分段边界："报" 的 UTF-8 为 E6 8A A6，首字节落在第一段
+_seg0 = "%E6"                          # 第一段只有首字节（加 charset 前缀）
+_seg1 = "%8A%A5%E5%91%8A.txt"          # 第二段续上剩余字节 + "告" + 扩展名
+_disp, _p, _ = mime.parse_content_disposition(
+    "attachment; filename=\"x\"; "
+    f"filename*0*=utf-8''{_seg0}; filename*1*={_seg1}")
+_fn, _ext, _note = mime.resolve_filename(_p)
+check("多字节字符跨分段组装", _fn == "报告.txt", (repr(_fn), _note))
+
+# 非法扩展值 -> 回退普通 filename
+_disp, _p, _ = mime.parse_content_disposition(
+    'attachment; filename="keep.txt"; filename*=garbage')
+_fn, _ext, _note = mime.resolve_filename(_p)
+check("非法 filename* 回退普通值", _fn == "keep.txt" and _ext is False and _note,
+      (_fn, _note))
+
+_disp, _p, _ = mime.parse_content_disposition(
+    'attachment; filename="keep2.txt"; filename*=utf-8\'\'bad%zz')
+_fn, _ext, _note = mime.resolve_filename(_p)
+check("非法百分号转义回退", _fn == "keep2.txt", _fn)
+
+# 分段不连续 -> 回退
+_disp, _p, _ = mime.parse_content_disposition(
+    "attachment; filename=\"k3\"; filename*0*=utf-8''a; filename*2*=c")
+_fn, _ext, _note = mime.resolve_filename(_p)
+check("分段编号不连续回退", _fn == "k3" and _note, (_fn, _note))
+
+# 不支持的 charset -> 回退
+_disp, _p, _ = mime.parse_content_disposition(
+    'attachment; filename="k4"; filename*=x-unknown-charset\'\'abc')
+_fn, _ext, _note = mime.resolve_filename(_p)
+check("未知 charset 回退", _fn == "k4", _fn)
+
+# GBK 扩展文件名
+_disp, _p, _ = mime.parse_content_disposition(
+    "attachment; filename=\"g\"; filename*=gbk''%CE%C4%BC%FE.txt")
+_fn, _ext, _note = mime.resolve_filename(_p)
+check("GBK charset 解码", _fn == "文件.txt", repr(_fn))
+
+# 解析树叶子带 disposition / filenameExtended / filenameNote
+raw18 = (
+    b"Content-Type: multipart/mixed; boundary=R18\r\n\r\n"
+    b"--R18\r\n"
+    b'Content-Disposition: attachment; filename="o.txt"; '
+    b"filename*=utf-8''r%C3%A9.txt\r\n\r\nhi\r\n"
+    b"--R18\r\nContent-Disposition: form-data; name=\"plain\"\r\n\r\nv\r\n"
+    b'--R18\r\nContent-Disposition: form-data; name="up"; filename="u.bin"\r\n'
+    b"Content-Transfer-Encoding: base64\r\n\r\nAAEC\r\n"
+    b"--R18--"
+)
+r18 = mime.parse_message(None, None, None,
+                         raw_base64=base64.b64encode(raw18).decode())
+leaves = r18["tree"]["parts"]
+check("叶子 disposition", leaves[0]["disposition"] == "attachment")
+check("叶子 filenameExtended", leaves[0]["filenameExtended"] is True
+      and leaves[0]["filename"] == "ré.txt", leaves[0])
+check("form-data 叶子 disposition", leaves[1]["disposition"] == "form-data")
+check("form-data 无 filename 时 filename 为 None", leaves[1]["filename"] is None)
+items = attachments.collect_attachments(r18["tree"])
+paths = [it["path"] for it in items]
+check("附件叶子递归列出（含 filename 参数的 form-data）",
+      paths == ["parts[0]", "parts[2]"], paths)
+check("RFC2231 来源标记", items[0]["filenameSource"] == "rfc2231")
+check("普通 filename 来源标记", items[1]["filenameSource"] == "header")
+check("扩展文件名字节数正确", items[0]["size"] == 2, items[0]["size"])
+check("base64 叶子导出解码后字节",
+      items[1]["size"] == 3 and items[1]["exportable"], items[1])
+
+# 19. 附件提取：无文件名按路径命名 / 净化 / 重名 -------------------------------
+print("19) 附件命名：路径兜底、净化、重名")
+check("净化路径分隔符与控制字符",
+      attachments.sanitize_filename("../a/b\\c\x00.txt", "fb") == ".._a_b_c.txt")
+check("净化 Windows 保留名",
+      attachments.sanitize_filename("CON", "fb") == "_CON")
+check("净化去除尾部点空格",
+      attachments.sanitize_filename("x.txt.  ", "fb") == "x.txt")
+check("净化空名用兜底", attachments.sanitize_filename("", "fb.bin") == "fb.bin")
+check("路径兜底命名",
+      attachments.fallback_name_for_path("parts[1].parts[0]")
+      == "parts[1].parts[0].bin")
+check("root 路径兜底", attachments.fallback_name_for_path("root") == "root.bin")
+
+raw19 = (
+    b"Content-Type: multipart/mixed; boundary=O19\r\n\r\n"
+    b'--O19\r\nContent-Disposition: attachment; filename="dup.bin"\r\n\r\nAAA\r\n'
+    b"--O19\r\nContent-Type: multipart/mixed; boundary=I19\r\n\r\n"
+    b'--I19\r\nContent-Disposition: attachment; filename="dup.bin"\r\n\r\nBBB\r\n'
+    b'--I19\r\nContent-Disposition: attachment; filename="../../etc/evil"\r\n\r\nCCC\r\n'
+    b"--I19--\r\n"
+    b'--O19\r\nContent-Disposition: attachment; filename="dup.bin"\r\n\r\nDDD\r\n'
+    b'--O19\r\nContent-Disposition: attachment\r\nContent-Type: text/plain\r\n\r\nnoname\r\n'
+    b"--O19--"
+)
+r19 = mime.parse_message(None, None, None,
+                         raw_base64=base64.b64encode(raw19).decode())
+items19 = attachments.collect_attachments(r19["tree"])
+names = [it["exportName"] for it in items19]
+check("重名按遍历顺序加序号",
+      names[0] == "dup.bin" and names[1] == "dup(1).bin" and names[3] == "dup(2).bin",
+      names)
+check("路径穿越文件名被净化", names[2] == ".._.._etc_evil", names)
+check("无文件名按路径命名",
+      items19[4]["exportName"] == "parts[3].bin"
+      and items19[4]["filenameSource"] == "path",
+      items19[4])
+# ZIP 内无路径穿越条目
+zb19, desc19, issues19 = attachments.build_attachment_zip(r19["tree"])
+z19 = zipfile.ZipFile(io.BytesIO(zb19))
+check("ZIP 条目数与可导出附件一致",
+      len(z19.namelist()) == 5 and len(set(z19.namelist())) == 5, z19.namelist())
+check("ZIP 条目内容正确（dup(1) 为 BBB）", z19.read("dup(1).bin") == b"BBB")
+check("ZIP 无 ../ 穿越条目",
+      all(not n.startswith("/") and ".." not in n.split("/") for n in z19.namelist()),
+      z19.namelist())
+
+# 选择性导出（paths 过滤）
+zb19b, _, _ = attachments.build_attachment_zip(r19["tree"], ["parts[0]"])
+z19b = zipfile.ZipFile(io.BytesIO(zb19b))
+check("按 paths 选择导出", z19b.namelist() == ["dup.bin"], z19b.namelist())
+
+# 20. 附件提取：畸形/未知 CTE 未编辑禁导，编辑后可导 --------------------------
+print("20) 畸形/未知 CTE 的导出限制")
+raw20 = (
+    b"Content-Type: multipart/mixed; boundary=B20\r\n\r\n"
+    b'--B20\r\nContent-Disposition: attachment; filename="bad.b64"\r\n'
+    b"Content-Transfer-Encoding: base64\r\n\r\n@@not-base64!!!\r\n"
+    b'--B20\r\nContent-Disposition: attachment; filename="unk.dat"\r\n'
+    b"Content-Transfer-Encoding: x-uuencode\r\n\r\nwire raw\r\n"
+    b'--B20\r\nContent-Disposition: attachment; filename="ok.txt"\r\n'
+    b"Content-Transfer-Encoding: base64\r\n\r\naGVsbG8=\r\n"
+    b"--B20--"
+)
+r20 = mime.parse_message(None, None, None,
+                         raw_base64=base64.b64encode(raw20).decode())
+items20 = attachments.collect_attachments(r20["tree"])
+check("畸形 base64 未编辑禁导",
+      items20[0]["exportable"] is False and items20[0]["size"] is None
+      and "畸形" in items20[0]["reason"], items20[0])
+check("禁导项给出原始传输字节大小",
+      items20[0]["wireSize"] == len(b"@@not-base64!!!"), items20[0]["wireSize"])
+check("未知 CTE 未编辑禁导",
+      items20[1]["exportable"] is False and "未知" in items20[1]["reason"],
+      items20[1])
+check("正常 base64 可导且为解码字节",
+      items20[2]["exportable"] and items20[2]["size"] == 5, items20[2])
+
+# 禁导项不进 ZIP，并产生跳过 issue
+zb20, _, iss20 = attachments.build_attachment_zip(r20["tree"])
+z20 = zipfile.ZipFile(io.BytesIO(zb20))
+check("禁导项不写入 ZIP", z20.namelist() == ["ok.txt"], z20.namelist())
+check("跳过项记录 issue",
+      len(iss20) == 2 and all(i["code"] == "ATTACHMENT_NOT_EXPORTABLE"
+                              for i in iss20), iss20)
+
+# 编辑畸形叶子后允许导出（重新编码后的字节）
+p20a = r20["tree"]["parts"][0]
+p20a["body"] = "fixed content"
+p20a["bodyEdited"] = True
+items20b = attachments.collect_attachments(r20["tree"])
+check("编辑后畸形叶子可导",
+      items20b[0]["exportable"] and items20b[0]["exportName"] == "bad.b64",
+      items20b[0])
+
+# 未知 CTE 叶子切换 CTE 后可导
+p20b = r20["tree"]["parts"][1]
+p20b["transferEncoding"] = "base64"
+p20b["bodyEdited"] = True
+items20c = attachments.collect_attachments(r20["tree"])
+check("切换 CTE 后未知叶子可导", items20c[1]["exportable"], items20c[1])
+zb20b, _, iss20b = attachments.build_attachment_zip(r20["tree"])
+z20b = zipfile.ZipFile(io.BytesIO(zb20b))
+check("编辑/切换后 ZIP 包含全部三项",
+      sorted(z20b.namelist()) == ["bad.b64", "ok.txt", "unk.dat"],
+      z20b.namelist())
+check("编辑后导出取编辑内容（base64 传输体可还原）",
+      base64.b64decode(b"".join(z20b.read("bad.b64").split(b"\r\n")))
+      == b"fixed content")
+check("跳过 issue 清零", iss20b == [], iss20b)
+
+# 21. 附件提取：QP 解码、编辑通道与 identity CTE ------------------------------
+print("21) QP/identity CTE 附件字节")
+raw21 = (
+    b"Content-Type: multipart/mixed; boundary=Q21\r\n\r\n"
+    b'--Q21\r\nContent-Disposition: attachment; filename="q.txt"\r\n'
+    b"Content-Transfer-Encoding: quoted-printable\r\n\r\n"
+    b"=E4=BD=A0=E5=A5=BD\r\n"
+    b'--Q21\r\nContent-Disposition: attachment; filename="raw.bin"\r\n'
+    b"Content-Transfer-Encoding: 8bit\r\n\r\n"
+    + "café".encode() + b"\r\n"
+    b"--Q21--"
+)
+r21 = mime.parse_message(None, None, None,
+                         raw_base64=base64.b64encode(raw21).decode())
+items21 = attachments.collect_attachments(r21["tree"])
+check("QP 附件导出为解码后字节",
+      items21[0]["size"] == 6 and items21[0]["exportable"], items21[0])
+zb21, _, _ = attachments.build_attachment_zip(r21["tree"])
+z21 = zipfile.ZipFile(io.BytesIO(zb21))
+check("ZIP 中 QP 内容已解码", z21.read("q.txt") == "你好".encode())
+check("8bit 附件原样导出", z21.read("raw.bin") == "café".encode())
+
+# 22. attachment 无 disposition 参数但有 filename（form-data 文件名）递归嵌套
+print("22) 嵌套 multipart 中的附件遍历顺序")
+raw22 = (
+    b"Content-Type: multipart/mixed; boundary=A22\r\n\r\n"
+    b"--A22\r\nContent-Type: multipart/alternative; boundary=B22\r\n\r\n"
+    b'--B22\r\nContent-Disposition: attachment; filename="deep1.txt"\r\n\r\n1\r\n'
+    b'--B22\r\nContent-Disposition: attachment; filename="deep2.txt"\r\n\r\n22\r\n'
+    b"--B22--\r\n"
+    b'--A22\r\nContent-Disposition: attachment; filename="top.txt"\r\n\r\n333\r\n'
+    b"--A22--"
+)
+r22 = mime.parse_message(None, None, None,
+                         raw_base64=base64.b64encode(raw22).decode())
+items22 = attachments.collect_attachments(r22["tree"])
+check("深层嵌套附件被递归列出",
+      [it["path"] for it in items22]
+      == ["parts[0].parts[0]", "parts[0].parts[1]", "parts[1]"],
+      [it["path"] for it in items22])
+check("先序遍历字节数", [it["size"] for it in items22] == [1, 2, 3],
+      [it["size"] for it in items22])
+zb22, _, _ = attachments.build_attachment_zip(r22["tree"])
+z22 = zipfile.ZipFile(io.BytesIO(zb22))
+check("嵌套 ZIP 条目齐全",
+      sorted(z22.namelist()) == ["deep1.txt", "deep2.txt", "top.txt"],
+      z22.namelist())
 
 print(f"\n结果: {PASS} 通过, {FAIL} 失败")
 sys.exit(1 if FAIL else 0)

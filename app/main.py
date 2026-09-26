@@ -1,14 +1,15 @@
-"""FastAPI 入口：提供解析、重新编码 API 与静态前端。"""
+"""FastAPI 入口：提供解析、重新编码、附件提取 API 与静态前端。"""
 
 from __future__ import annotations
 
 import os
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from .attachments import build_attachment_zip, collect_attachments
 from .diff import diff_results
 from .mime import encode_tree, parse_message
 
@@ -16,7 +17,7 @@ app = FastAPI(
     title="MIME Multipart 报文检查器",
     description="按 RFC 2045/2046 解析嵌套 multipart 与 Content-Transfer-Encoding，"
                 "编辑后按原 boundary 规则与 CTE 折行重新编码。",
-    version="1.1.0",
+    version="1.2.0",
 )
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
@@ -55,6 +56,17 @@ class DiffRequest(BaseModel):
     b: DiffSample
 
 
+class AttachmentsRequest(BaseModel):
+    # tree 为 /api/parse 的结果（可能已在页面上编辑过头部/正文/CTE）。
+    tree: dict
+
+
+class AttachmentZipRequest(BaseModel):
+    tree: dict
+    # 勾选要导出的叶子 path；为空表示导出全部可导出附件
+    paths: list[str] = Field(default_factory=list)
+
+
 @app.get("/api/health")
 def health():
     return {"ok": True}
@@ -77,6 +89,45 @@ def api_encode(req: EncodeRequest):
 def api_diff(req: DiffRequest):
     result = diff_results(req.a.model_dump(), req.b.model_dump())
     return JSONResponse(result)
+
+
+@app.post("/api/attachments")
+def api_attachments(req: AttachmentsRequest):
+    """递归列出当前树中的附件叶子（路径/文件名/字节数/不可导出原因）。"""
+    items = collect_attachments(req.tree)
+    exportable = [it for it in items if it["exportable"]]
+    return JSONResponse({
+        "ok": True,
+        "items": items,
+        "total": len(items),
+        "exportableCount": len(exportable),
+        "totalBytes": sum(it["size"] or 0 for it in exportable),
+    })
+
+
+@app.post("/api/attachments/zip")
+def api_attachments_zip(req: AttachmentZipRequest):
+    """把勾选（缺省全部）的可导出附件按 CTE 解码后字节打包为 ZIP。"""
+    selected = set(req.paths or [])
+    zip_bytes, _descriptors, issues = build_attachment_zip(req.tree, req.paths)
+    items = collect_attachments(req.tree)
+    exported = [it for it in items
+                if it["exportable"] and (not selected or it["path"] in selected)]
+    if not exported:
+        return JSONResponse(
+            {"ok": False,
+             "error": "没有可导出的附件（所选叶子可能因畸形/未知 CTE 被禁导）",
+             "issues": issues},
+            status_code=409,
+        )
+    headers = {
+        "Content-Disposition": 'attachment; filename="attachments.zip"',
+        "X-Attachment-Count": str(len(exported)),
+        "X-Attachment-Skipped": str(len(issues)),
+    }
+    return Response(content=zip_bytes,
+                    media_type="application/zip",
+                    headers=headers)
 
 
 @app.get("/")

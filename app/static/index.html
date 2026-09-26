@@ -12,7 +12,7 @@
     <span class="logo">▥</span>
     <div>
       <h1>MIME Multipart 报文检查器</h1>
-      <p class="sub">RFC 2045/2046 · 嵌套 multipart · Content-Transfer-Encoding · quoted 参数 · CRLF 边界 · 编辑后重新编码</p>
+      <p class="sub">RFC 2045/2046/2231 · 嵌套 multipart · Content-Transfer-Encoding · quoted 参数 · CRLF 边界 · 附件提取 ZIP · 编辑后重新编码</p>
     </div>
   </div>
   <div class="topbar-actions">
@@ -87,9 +87,48 @@
     </div>
   </section>
 
+  <section class="card hidden" id="attachmentsCard">
+    <div class="card-head">
+      <h2>3. 附件提取与 ZIP 下载</h2>
+      <div class="head-actions">
+        <button id="btnRefreshAttachments" class="btn btn-sm" type="button">刷新列表</button>
+      </div>
+    </div>
+    <div class="hint tree-hint">递归列出 <code>Content-Disposition: attachment</code> 或带
+      <code>filename</code> / RFC 2231 <code>filename*</code> 参数的叶子。ZIP 使用
+      <b>CTE 解码后</b>的字节；已编辑叶子取编辑后的内容。畸形或未知 CTE 的<b>未编辑</b>叶子
+      禁导（勾选框禁用并说明原因）。文件名已去除路径分隔符与控制字符，重名按遍历顺序加序号。
+    </div>
+    <div class="attachments-toolbar">
+      <label class="check">
+        <input type="checkbox" id="selectAllAttachments">
+        全选可导出项
+      </label>
+      <button id="btnDownloadZip" class="btn btn-primary" type="button" disabled>
+        下载所选为 ZIP
+      </button>
+      <span id="attachmentsMeta" class="parse-meta"></span>
+    </div>
+    <div class="attachments-table-wrap">
+      <table class="attachments-table">
+        <thead>
+          <tr>
+            <th class="col-check"></th>
+            <th class="col-name">ZIP 内文件名</th>
+            <th class="col-path">节点路径</th>
+            <th class="col-disp">Disposition</th>
+            <th class="col-size">字节数</th>
+            <th class="col-reason">不可导出原因 / 文件名说明</th>
+          </tr>
+        </thead>
+        <tbody id="attachmentsList"></tbody>
+      </table>
+    </div>
+  </section>
+
   <section class="card hidden" id="outputCard">
     <div class="card-head">
-      <h2>3. 重新编码结果</h2>
+      <h2>4. 重新编码结果</h2>
       <div id="encodeMeta" class="parse-meta"></div>
     </div>
     <ul id="encodeIssues" class="issues compact"></ul>
@@ -107,7 +146,7 @@
 
   <section class="card" id="compareCard">
     <div class="card-head">
-      <h2>4. 样本对比</h2>
+      <h2>5. 样本对比</h2>
       <div class="hint">把解析结果分别存为样本 A / B（保存在浏览器 localStorage，可来自不同报文或编辑前后），按树路径对齐比较媒体类型、头部、正文编码、boundary、序言/尾注与诊断代码。</div>
     </div>
 

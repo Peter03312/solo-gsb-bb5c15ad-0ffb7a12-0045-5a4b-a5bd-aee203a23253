@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import codecs
 import re
 from dataclasses import dataclass, field
 from typing import Optional
@@ -142,6 +143,20 @@ def parse_content_type(header_value: Optional[str], issues: list[dict],
         _issue(issues, "warning", "BAD_MEDIA_TYPE",
                f"{context} 的媒体类型含可疑字符：{media_type!r}")
 
+    params = parse_header_parameters(rest, issues, context=context,
+                                     boundary_warnings=True)
+    return media_type, params
+
+
+def parse_header_parameters(rest: bytes, issues: list[dict],
+                            context: str = "头部参数",
+                            boundary_warnings: bool = False) -> dict[str, str]:
+    """解析头部值中首个分号之后的 ``; key=value`` 参数序列。
+
+    支持 quoted-string、反斜杠转义与游离字符恢复；Content-Type 与
+    Content-Disposition（含 RFC 2231 扩展参数）共用同一分词器。
+    """
+    params: dict[str, str] = {}
     # 参数分词：支持 quoted-string 与反斜杠转义
     i, n = 0, len(rest)
     while i < n:
@@ -221,7 +236,7 @@ def parse_content_type(header_value: Optional[str], issues: list[dict],
             semi = rest.find(b";", i)
             i = n if semi < 0 else semi + 1
 
-        if name == "boundary":
+        if name == "boundary" and boundary_warnings:
             bval = value.encode("utf-8", errors="replace")
             if b" " in bval:
                 _issue(issues, "warning", "BOUNDARY_SUSPICIOUS",
@@ -232,7 +247,7 @@ def parse_content_type(header_value: Optional[str], issues: list[dict],
                        "boundary 超过 70 个字符或包含 RFC 2046 允许字符集之外的字符，"
                        "兼容性可能存在问题")
         params[name] = value
-    return media_type, params
+    return params
 
 
 def build_content_type(media_type: str, params: dict[str, str]) -> str:
@@ -494,13 +509,40 @@ def _leaf_node_fields(headers: list[dict], body: bytes,
     cd = find_header(headers, "Content-Disposition")
     name = None
     filename = None
+    disposition = None
+    filename_ext = False
+    filename_note = None
     if cd is not None:
-        cd_params = _parse_secondary_params(cd["value"])
+        disposition, cd_params, fnote = parse_content_disposition(cd["value"])
+        if fnote:
+            filename_note = fnote
         name = cd_params.get("name")
-        filename = cd_params.get("filename")
+        fname, fext, fnote = resolve_filename(cd_params)
+        filename = fname
+        filename_ext = fext
+        if fnote:
+            filename_note = (filename_note + "；" if filename_note else "") + fnote
     fields["name"] = name
     fields["filename"] = filename
+    fields["filenameExtended"] = filename_ext
+    fields["filenameNote"] = filename_note
+    fields["disposition"] = disposition
+    # 是否声明了任何形式的文件名参数（含空 filename=""）
+    fields["hasFilenameParam"] = _has_filename_param(cd) if cd is not None else False
     return fields
+
+
+def _has_filename_param(cd_header: dict) -> bool:
+    """Content-Disposition 是否携带 filename / filename* / filename*n* 参数。"""
+    _disp, params, _note = parse_content_disposition(cd_header.get("value"))
+    for key in params:
+        kl = key.lower()
+        if kl == "filename" or kl == "filename*":
+            return True
+        m = _RFC2231_SEG_RE.match(key)
+        if m and m.group(1).lower() == "filename":
+            return True
+    return False
 
 
 def _check_multipart_cte(headers: list[dict], issues: list[dict], path: str):
@@ -747,11 +789,180 @@ def _build_part(raw: bytes, issues: list[dict], path: str) -> dict:
     }
 
 
-def _parse_secondary_params(value: str) -> dict[str, str]:
-    """仅解析 `; key=value` 参数（用于 Content-Disposition）。"""
+def parse_content_disposition(value: Optional[str]):
+    """解析 Content-Disposition 头（RFC 2183），含 RFC 2231 参数。
+
+    返回 ``(disposition, params, note)``：
+      * disposition：首个 token 的小写形式（如 ``attachment`` / ``form-data``），
+        头缺失或畸形时为 None；
+      * params：普通参数（``name``、``filename``…）。RFC 2231 扩展参数
+        （``filename*``、``filename*0*`` 等）保留原始 token 键，交给
+        :func:`resolve_filename` 组装；
+      * note：RFC 2231 分段/扩展值的非致命诊断说明（供前端展示），无则 None。
+    """
+    if not value:
+        return None, {}, None
+    data = value.encode("utf-8", errors="replace")
+    if b";" in data:
+        disp_b, rest = data.split(b";", 1)
+    else:
+        disp_b, rest = data, b""
+    disp = disp_b.strip().decode("ascii", errors="replace").lower() or None
     issues: list[dict] = []
-    _, params = parse_content_type("application/x-ignored; " + value, issues)
-    return params
+    params = parse_header_parameters(rest, issues,
+                                     context="Content-Disposition")
+    # 复用统一分词器：这里的语法问题此前不会阻断解析，仅作为 filenameNote 透出
+    note = "；".join(it["message"] for it in issues
+                     if it["code"] in ("BAD_PARAM_SYNTAX", "BAD_QUOTED_STRING")) or None
+    return disp, params, note
+
+
+# RFC 2231：filename*=charset'lang'value，filename*0*=...（*1* 可不带末尾 *）
+_RFC2231_SEG_RE = re.compile(r"^([\w.+-]+)\*(\d+)\*?$")
+# RFC 2231 扩展值中允许的未编码字符：attr-char（token 字符 + 空格与
+# ()<>@,;:"/[]?= 等分隔符；'%'、'*'' 与单引号必须写成 %XX）
+_ATTR_CHAR_RE = re.compile(
+    r"[A-Za-z0-9!#$&+\-.^_`~|()<>@,;:\"/\[\]? \t=]")
+# 合法的 charset token
+_CHARSET_RE = re.compile(r"^[A-Za-z][A-Za-z0-9!#$%&+\-^_`.]{0,39}$")
+
+
+def _parse_ext_prefix(raw: str):
+    """解析 RFC 2231 值的 ``charset'language'value`` 前缀结构。
+
+    返回 ``(charset, value, reason)``；仅校验结构与 charset 名，
+    不做字节解码（分段拼接时多字节字符可能跨段）。
+    """
+    parts = raw.split("'")
+    if len(parts) != 3:
+        return None, None, "扩展值缺少 charset'lang'value 结构"
+    charset, _lang, value = parts
+    if not _CHARSET_RE.match(charset):
+        return None, None, f"扩展值的字符集 {charset!r} 非法"
+    return charset, value, None
+
+
+def _decode_ext_value(raw: str):
+    """解码单个 RFC 2231 扩展值 ``charset'language'percent-value``。
+
+    返回 (text|None, bytes|None, reason)：非法时 text/bytes 为 None，
+    reason 说明原因。
+    """
+    charset, value, reason = _parse_ext_prefix(raw)
+    if charset is None:
+        return None, None, reason
+    ok, raw_bytes = _percent_decode_bytes(value)
+    if not ok:
+        return None, None, "扩展值含未编码的非法字符或错误的百分号转义"
+    try:
+        codecs.lookup(charset)
+    except LookupError:
+        return None, None, f"扩展值声明的字符集 {charset!r} 不受支持"
+    try:
+        text = raw_bytes.decode(charset, errors="strict")
+    except (UnicodeDecodeError, LookupError):
+        return None, None, f"扩展值无法按 {charset} 解码"
+    return text, raw_bytes, None
+
+
+def resolve_filename(params: dict[str, str]):
+    """按 RFC 2231/6266 从 Content-Disposition 参数解析文件名。
+
+    优先级：
+      1. 分段扩展参数 ``filename*0*`` / ``filename*1`` …（连续 0 起始、
+         不重号）；首段携带 ``charset'lang'`` 前缀，续段只有百分号字节，
+         拼接后按首段声明的 charset 统一解码（多字节字符可能跨段）；
+      2. 单个扩展参数 ``filename*``；
+      3. 普通 ``filename``。
+
+    扩展值非法时回退普通 filename。返回 ``(filename|None, extended, note)``。
+    """
+    plain = params.get("filename")
+    segments: dict[int, str] = {}
+    single_ext = None
+    for key, val in params.items():
+        m = _RFC2231_SEG_RE.match(key)
+        if not m:
+            continue
+        if m.group(1).lower() != "filename":
+            continue
+        segments[int(m.group(2))] = val
+    if "filename*" in params:
+        single_ext = params["filename*"]
+
+    if segments:
+        indexes = sorted(segments)
+        if indexes != list(range(len(indexes))):
+            return plain, False, (
+                "filename* 分段编号不连续或不从 0 开始，已回退普通 filename")
+        first_text, first_bytes, reason = _decode_ext_value(segments[0])
+        if first_text is None and reason:
+            # 多字节字符可能恰好跨首段边界：先只校验结构，拼接后统一解码
+            charset0, value0, pre_reason = _parse_ext_prefix(segments[0])
+            if charset0 is None:
+                return plain, False, (
+                    f"RFC 2231 扩展文件名非法（{pre_reason}），已回退普通 filename")
+            ok0, first_bytes = _percent_decode_bytes(value0)
+            if not ok0:
+                return plain, False, (
+                    "RFC 2231 扩展文件名非法（扩展值含未编码的非法字符或错误的"
+                    "百分号转义），已回退普通 filename")
+            try:
+                codecs.lookup(charset0)
+            except LookupError:
+                return plain, False, (
+                    f"RFC 2231 扩展文件名非法（扩展值声明的字符集 "
+                    f"{charset0!r} 不受支持），已回退普通 filename")
+        else:
+            charset0 = segments[0].split("'", 1)[0]
+        charset = charset0
+        raw_bytes = bytearray(first_bytes)
+        for idx in indexes[1:]:
+            ok, part = _percent_decode_bytes(segments[idx])
+            if not ok:
+                return plain, False, (
+                    f"filename*{idx}* 含非法字符或百分号转义，"
+                    "已回退普通 filename")
+            raw_bytes += part
+        try:
+            text = bytes(raw_bytes).decode(charset, errors="strict")
+        except (UnicodeDecodeError, LookupError):
+            return plain, False, (
+                f"filename* 续段无法按 {charset} 解码，已回退普通 filename")
+        if text == "":
+            return plain, False, "RFC 2231 扩展文件名为空，已回退普通 filename"
+        return text, True, None
+
+    if single_ext is not None:
+        text, _raw, reason = _decode_ext_value(single_ext)
+        if text is None:
+            return plain, False, (
+                f"RFC 2231 扩展文件名非法（{reason}），已回退普通 filename")
+        if text == "":
+            return plain, False, "RFC 2231 扩展文件名为空，已回退普通 filename"
+        return text, True, None
+
+    return plain, False, None
+
+
+def _percent_decode_bytes(seg: str):
+    """解码 RFC 2231 值/续段（仅 attr-char + %XX），返回 (ok, bytes)。"""
+    out = bytearray()
+    p = 0
+    while p < len(seg):
+        ch = seg[p]
+        if ch == "%":
+            m = re.match(r"%[0-9A-Fa-f]{2}", seg[p:])
+            if not m:
+                return False, b""
+            out.append(int(seg[p + 1:p + 3], 16))
+            p += 3
+            continue
+        if not _ATTR_CHAR_RE.match(ch):
+            return False, b""
+        out.append(ord(ch))
+        p += 1
+    return True, bytes(out)
 
 
 # --------------------------------------------------------------------------- #
